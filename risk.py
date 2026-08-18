@@ -11,6 +11,14 @@ from strategy import Opportunity
 
 UTC = timezone.utc
 
+MARKET_DATA_BREAKER_REASONS = frozenset(
+    {
+        "incoherent_spot_data",
+        "incoherent_orderbook",
+        "stale_data",
+    }
+)
+
 
 @dataclass(frozen=True)
 class RiskDecision:
@@ -27,6 +35,11 @@ class RiskState:
     failed_orders: int = 0
     circuit_breaker: bool = False
     breaker_reason: str | None = None
+    market_data_breaker: bool = False
+    market_data_breaker_reason: str | None = None
+    market_data_recovery_streak: int = 0
+    market_data_breaker_triggers: int = 0
+    market_data_recoveries: int = 0
     session_day: date | None = None
 
 
@@ -45,7 +58,49 @@ class RiskEngine:
             self.state.failed_orders = 0
             self.state.circuit_breaker = False
             self.state.breaker_reason = None
+            self.state.market_data_recovery_streak = 0
             self.state.session_day = current_day
+
+    @property
+    def market_data_recovery_required(self) -> int:
+        return max(1, self.config.market_data_recovery_observations)
+
+    def _market_data_is_safe(
+        self,
+        *,
+        data_age_ms: float,
+        data_coherent: bool,
+        orderbook_coherent: bool,
+    ) -> bool:
+        return (
+            data_coherent
+            and orderbook_coherent
+            and data_age_ms <= self.config.maximum_data_age_ms
+        )
+
+    def _trigger_market_data(self, reason: str) -> None:
+        if not self.state.market_data_breaker:
+            self.state.market_data_breaker_triggers += 1
+        self.state.market_data_breaker = True
+        self.state.market_data_breaker_reason = reason
+        self.state.market_data_recovery_streak = 0
+
+    def _advance_market_data_recovery(self, data_safe: bool) -> bool:
+        """Return whether a latched market-data breaker has safely released."""
+
+        if not self.state.market_data_breaker:
+            return True
+        if not data_safe:
+            self.state.market_data_recovery_streak = 0
+            return False
+        self.state.market_data_recovery_streak += 1
+        if self.state.market_data_recovery_streak < self.market_data_recovery_required:
+            return False
+        self.state.market_data_breaker = False
+        self.state.market_data_breaker_reason = None
+        self.state.market_data_recovery_streak = 0
+        self.state.market_data_recoveries += 1
+        return True
 
     def evaluate(
         self,
@@ -66,8 +121,30 @@ class RiskEngine:
         )
         self._roll_day(current)
         capital = max(0.0, opportunity.capital_required)
+        data_safe = self._market_data_is_safe(
+            data_age_ms=data_age_ms,
+            data_coherent=data_coherent,
+            orderbook_coherent=orderbook_coherent,
+        )
+
+        if self.state.circuit_breaker:
+            return RiskDecision(
+                False,
+                self.state.breaker_reason or "circuit_breaker",
+                capital,
+            )
+        if self.state.market_data_breaker and not self._advance_market_data_recovery(data_safe):
+            return RiskDecision(
+                False,
+                (
+                    "market_data_recovery_pending"
+                    if data_safe
+                    else self.state.market_data_breaker_reason or "market_data_breaker"
+                ),
+                capital,
+            )
+
         checks = (
-            (self.state.circuit_breaker, self.state.breaker_reason or "circuit_breaker"),
             (not data_coherent, "incoherent_spot_data"),
             (not orderbook_coherent, "incoherent_orderbook"),
             (not market_open, "market_closed"),
@@ -93,13 +170,12 @@ class RiskEngine:
         )
         for failed, reason in checks:
             if failed:
-                if reason in {
-                    "stale_data",
+                if reason in MARKET_DATA_BREAKER_REASONS:
+                    self._trigger_market_data(reason)
+                elif reason in {
                     "execution_latency_too_high",
                     "daily_loss_limit",
                     "consecutive_loss_limit",
-                    "incoherent_spot_data",
-                    "incoherent_orderbook",
                 }:
                     self.trigger(reason)
                 return RiskDecision(False, reason, capital)
@@ -137,4 +213,10 @@ class RiskEngine:
             "failed_orders": self.state.failed_orders,
             "circuit_breaker": self.state.circuit_breaker,
             "breaker_reason": self.state.breaker_reason,
+            "market_data_breaker": self.state.market_data_breaker,
+            "market_data_breaker_reason": self.state.market_data_breaker_reason,
+            "market_data_recovery_streak": self.state.market_data_recovery_streak,
+            "market_data_recovery_required": self.market_data_recovery_required,
+            "market_data_breaker_triggers": self.state.market_data_breaker_triggers,
+            "market_data_recoveries": self.state.market_data_recoveries,
         }

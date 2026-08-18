@@ -5,8 +5,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import math
+import statistics
 import time
-from dataclasses import replace
+from collections import Counter
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -42,6 +45,161 @@ def _fee_model(market: PolymarketMarket, config: AppConfig) -> FeeModel:
 
 def _market_changed(old: PolymarketMarket | None, new: PolymarketMarket | None) -> bool:
     return bool(new and (old is None or old.market_id != new.market_id))
+
+
+def _numeric_summary(values: list[float]) -> dict[str, float | int | None]:
+    finite = [value for value in values if math.isfinite(value)]
+    return {
+        "count": len(values),
+        "finite_count": len(finite),
+        "mean": statistics.fmean(finite) if finite else None,
+        "median": statistics.median(finite) if finite else None,
+        "max": max(finite) if finite else None,
+    }
+
+
+def _book_failure_reasons(book: OrderBook) -> list[str]:
+    """Classify the predicates used by OrderBook.coherent()."""
+
+    reasons: list[str] = []
+    if book.best_bid is None:
+        reasons.append("missing_bid")
+    if book.best_ask is None:
+        reasons.append("missing_ask")
+    if any(
+        level.price <= 0 or level.quantity < 0
+        for level in book.bids + book.asks
+    ):
+        reasons.append("invalid_level")
+    if (
+        book.best_bid is not None
+        and book.best_ask is not None
+        and book.best_bid.price > book.best_ask.price
+    ):
+        reasons.append("crossed_book")
+    return reasons
+
+
+@dataclass
+class RuntimeDiagnostics:
+    """Read-only runtime diagnostics; never feeds values back into decisions."""
+
+    incoherent_orderbook_rejections: int = 0
+    incoherent_reason_counts: Counter[str] = field(default_factory=Counter)
+    timestamp_deltas_ms: list[float] = field(default_factory=list)
+    up_ages_ms: list[float] = field(default_factory=list)
+    down_ages_ms: list[float] = field(default_factory=list)
+    crossed_books: int = 0
+    stale_rejections: int = 0
+    structural_incoherent_rejections: int = 0
+    insufficient_edge_count: int = 0
+    insufficient_edge_gross: list[float] = field(default_factory=list)
+    insufficient_edge_net: list[float] = field(default_factory=list)
+    insufficient_edge_fees: list[float] = field(default_factory=list)
+    insufficient_edge_slippage: list[float] = field(default_factory=list)
+    insufficient_edge_prices: list[float] = field(default_factory=list)
+    insufficient_edge_time_remaining: list[float] = field(default_factory=list)
+    insufficient_edge_sides: Counter[str] = field(default_factory=Counter)
+
+    def record_orderbook_rejection(
+        self,
+        *,
+        up_book: OrderBook,
+        down_book: OrderBook,
+        up_age_ms: float,
+        down_age_ms: float,
+        orderbook_coherent: bool,
+        fresh_books: bool,
+        logger: logging.Logger,
+    ) -> None:
+        up_reasons = _book_failure_reasons(up_book)
+        down_reasons = _book_failure_reasons(down_book)
+        structural_reasons = sorted(set(up_reasons + down_reasons))
+        self.incoherent_orderbook_rejections += 1
+        self.up_ages_ms.append(up_age_ms)
+        self.down_ages_ms.append(down_age_ms)
+        if up_book.updated_at is not None and down_book.updated_at is not None:
+            self.timestamp_deltas_ms.append(
+                abs((up_book.updated_at - down_book.updated_at).total_seconds() * 1000.0)
+            )
+
+        crossed = "crossed_book" in structural_reasons
+        if crossed:
+            self.crossed_books += 1
+        if not fresh_books:
+            self.stale_rejections += 1
+        if not orderbook_coherent:
+            self.structural_incoherent_rejections += 1
+
+        if orderbook_coherent and fresh_books:
+            # The risk decision can still carry this reason after the
+            # RiskEngine circuit breaker was latched by an earlier rejection.
+            primary_reason = "circuit_breaker_latched"
+        elif not fresh_books and not orderbook_coherent:
+            primary_reason = "stale_and_structurally_incoherent"
+        elif not fresh_books:
+            primary_reason = "stale"
+        elif structural_reasons:
+            primary_reason = "+".join(structural_reasons)
+        else:
+            primary_reason = "other"
+        self.incoherent_reason_counts[primary_reason] += 1
+
+        logger.debug(
+            "[DIAGNOSTIC] incoherent_orderbook primary=%s reasons_up=%s reasons_down=%s "
+            "up_bid=%s up_ask=%s down_bid=%s down_ask=%s up_timestamp=%s down_timestamp=%s "
+            "up_age_ms=%.3f down_age_ms=%.3f timestamp_delta_ms=%s "
+            "up_coherent=%s down_coherent=%s fresh_books=%s orderbook_coherent=%s",
+            primary_reason,
+            "+".join(up_reasons) or "none",
+            "+".join(down_reasons) or "none",
+            up_book.best_bid.price if up_book.best_bid else None,
+            up_book.best_ask.price if up_book.best_ask else None,
+            down_book.best_bid.price if down_book.best_bid else None,
+            down_book.best_ask.price if down_book.best_ask else None,
+            up_book.updated_at.isoformat() if up_book.updated_at else None,
+            down_book.updated_at.isoformat() if down_book.updated_at else None,
+            up_age_ms,
+            down_age_ms,
+            self.timestamp_deltas_ms[-1] if self.timestamp_deltas_ms else None,
+            up_book.coherent(),
+            down_book.coherent(),
+            fresh_books,
+            orderbook_coherent,
+        )
+
+    def record_insufficient_edge(self, opportunity: Opportunity) -> None:
+        self.insufficient_edge_count += 1
+        self.insufficient_edge_gross.append(opportunity.gross_edge)
+        self.insufficient_edge_net.append(opportunity.net_edge)
+        self.insufficient_edge_fees.append(opportunity.estimated_fees)
+        self.insufficient_edge_slippage.append(opportunity.estimated_slippage)
+        if opportunity.executable_price is not None:
+            self.insufficient_edge_prices.append(opportunity.executable_price)
+        self.insufficient_edge_time_remaining.append(opportunity.time_remaining)
+        self.insufficient_edge_sides[opportunity.side] += 1
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "incoherent_orderbook_rejections": self.incoherent_orderbook_rejections,
+            "incoherent_reason_counts": dict(sorted(self.incoherent_reason_counts.items())),
+            "timestamp_delta_ms": _numeric_summary(self.timestamp_deltas_ms),
+            "up_age_ms": _numeric_summary(self.up_ages_ms),
+            "down_age_ms": _numeric_summary(self.down_ages_ms),
+            "crossed_books": self.crossed_books,
+            "stale_rejections": self.stale_rejections,
+            "structural_incoherent_rejections": self.structural_incoherent_rejections,
+            "insufficient_edge": {
+                "count": self.insufficient_edge_count,
+                "gross_edge": _numeric_summary(self.insufficient_edge_gross),
+                "net_edge": _numeric_summary(self.insufficient_edge_net),
+                "fees": _numeric_summary(self.insufficient_edge_fees),
+                "slippage": _numeric_summary(self.insufficient_edge_slippage),
+                "executable_price": _numeric_summary(self.insufficient_edge_prices),
+                "time_remaining_s": _numeric_summary(self.insufficient_edge_time_remaining),
+                "sides": dict(sorted(self.insufficient_edge_sides.items())),
+            },
+        }
 
 
 def _settle_matured_trades(
@@ -116,6 +274,7 @@ async def _process_tick(
     strategy: StrategyEngine,
     open_trades: list[PaperTrade],
     logger: logging.Logger,
+    diagnostics: RuntimeDiagnostics | None = None,
 ) -> None:
     decision_time = utc_now()
     processing_started = time.perf_counter()
@@ -149,6 +308,16 @@ async def _process_tick(
             book.age_ms(decision_time) if book else float("inf"),
         )
 
+    up_book = books.get(market.up_token_id)
+    down_book = books.get(market.down_token_id)
+    if up_book is None or down_book is None:
+        missing = [
+            outcome for outcome, book in (("UP", up_book), ("DOWN", down_book)) if book is None
+        ]
+        logger.info("[ORDERBOOK] market data not ready; missing=%s", ",".join(missing))
+        return
+    required_books = (up_book, down_book)
+
     opportunities = strategy.evaluate(
         market,
         tick,
@@ -157,18 +326,14 @@ async def _process_tick(
         decision_time,
     )
     for opportunity in opportunities:
-        orderbook_coherent = all(
-            books.get(token_id) is not None and books[token_id].coherent()
-            for token_id in market.token_ids
-        )
+        orderbook_coherent = all(book is not None and book.coherent() for book in required_books)
+        book_ages = [book.age_ms(decision_time) for book in required_books if book is not None]
         fresh_books = all(
-            books.get(token_id) is not None
-            and books[token_id].age_ms(decision_time) <= risk.config.maximum_data_age_ms
-            for token_id in market.token_ids
+            age_ms <= risk.config.maximum_data_age_ms for age_ms in book_ages
         )
         decision = risk.evaluate(
             opportunity,
-            data_age_ms=max(data_age, *(books[token_id].age_ms(decision_time) for token_id in market.token_ids if token_id in books)),
+            data_age_ms=max((data_age, *book_ages)),
             execution_latency_ms=max(
                 tick.latency_ms or 0.0,
                 (time.perf_counter() - processing_started) * 1000.0,
@@ -183,6 +348,18 @@ async def _process_tick(
                 and market.remaining_seconds_at(decision_time) > 0
             ),
         )
+        if diagnostics and decision.reason == "incoherent_orderbook":
+            diagnostics.record_orderbook_rejection(
+                up_book=up_book,
+                down_book=down_book,
+                up_age_ms=up_book.age_ms(decision_time),
+                down_age_ms=down_book.age_ms(decision_time),
+                orderbook_coherent=orderbook_coherent,
+                fresh_books=fresh_books,
+                logger=logger,
+            )
+        elif diagnostics and decision.reason == "insufficient_edge":
+            diagnostics.record_insufficient_edge(opportunity)
         opportunity.decision = "ACCEPT" if decision.accepted else "REJECT"
         opportunity.decision_reason = decision.reason
         database.insert_opportunity(opportunity)
@@ -233,6 +410,7 @@ async def run_live(config: AppConfig, duration: float | None = None) -> None:
     )
     state: dict[str, PolymarketMarket | None] = {"market": None}
     open_trades: list[PaperTrade] = []
+    diagnostics = RuntimeDiagnostics()
 
     async with httpx.AsyncClient(
         timeout=config.network_timeout_seconds,
@@ -323,6 +501,7 @@ async def run_live(config: AppConfig, duration: float | None = None) -> None:
                 strategy=strategy,
                 open_trades=open_trades,
                 logger=logger,
+                diagnostics=diagnostics,
             )
 
         async def stop_after_duration() -> None:
@@ -349,6 +528,8 @@ async def run_live(config: AppConfig, duration: float | None = None) -> None:
             await asyncio.gather(*tasks, return_exceptions=True)
             report = analyze(database.fetch_opportunities(), database.fetch_trades())
             logger.info("[ANALYTICS] %s", report.as_dict())
+            logger.info("[RISK] final_status=%s", risk.status())
+            logger.info("[DIAGNOSTIC] %s", diagnostics.summary())
             database.close()
 
 

@@ -42,6 +42,9 @@ class RiskConfig:
     maximum_data_age_ms: float = 2_000.0
     maximum_execution_latency_ms: float = 1_500.0
     failed_orders_before_breaker: int = 3
+    # A market-data breaker needs three consecutive safe evaluations before
+    # it can release.  The evaluations themselves remain blocked.
+    market_data_recovery_observations: int = 3
 
 
 @dataclass(frozen=True)
@@ -101,6 +104,7 @@ def load_config(env_file: str | Path | None = ".env") -> AppConfig:
         maximum_data_age_ms=_env_float("MAXIMUM_DATA_AGE_MS", 2_000.0),
         maximum_execution_latency_ms=_env_float("MAXIMUM_EXECUTION_LATENCY_MS", 1_500.0),
         failed_orders_before_breaker=_env_int("FAILED_ORDERS_BEFORE_BREAKER", 3),
+        market_data_recovery_observations=_env_int("MARKET_DATA_RECOVERY_OBSERVATIONS", 3),
     )
     strategy = StrategyConfig(
         volatility_lookback=_env_int("VOLATILITY_LOOKBACK", 60),

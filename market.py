@@ -541,29 +541,152 @@ class MarketDiscovery:
             return markets if isinstance(markets, list) else []
         return []
 
-    @classmethod
-    def parse_market(cls, raw: dict[str, Any]) -> PolymarketMarket | None:
-        condition_id = str(raw.get("conditionId") or raw.get("condition_id") or "")
-        market_id = str(raw.get("id") or raw.get("marketId") or "")
-        end_time = parse_datetime(raw.get("endDate") or raw.get("end_date"))
-        if not condition_id or not market_id or not end_time:
-            return None
+    async def list_current_markets(
+        self,
+        now: datetime,
+        window_seconds: float = 30.0 * 60.0,
+    ) -> list[dict[str, Any]]:
+        """Fetch the small Gamma window that can contain the current interval.
 
+        The current crypto market schema uses ``endDate`` for the actual
+        interval end but ``startDate`` for creation time.  Gamma's keyset
+        endpoint can filter on ``end_date_min``/``end_date_max``; using that
+        window avoids scanning unrelated historical markets and avoids an
+        assumption about sequential market slugs or IDs.
+        """
+
+        current = as_utc(now)
+        params: dict[str, Any] = {
+            "closed": "false",
+            "limit": 100,
+            "order": "endDate",
+            "ascending": "true",
+            "end_date_min": current.isoformat().replace("+00:00", "Z"),
+            "end_date_max": (
+                current + timedelta(seconds=max(60.0, window_seconds))
+            ).isoformat().replace("+00:00", "Z"),
+        }
+        try:
+            response = await self.http.get(
+                f"{self.gamma_url}/markets/keyset", params=params
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            self.logger.warning("[MARKET] current Gamma window unavailable: %s", exc)
+            return []
+
+        if isinstance(payload, list):
+            return [item for item in payload if isinstance(item, dict)]
+        if isinstance(payload, dict):
+            page = payload.get("markets", payload.get("data", []))
+            return [item for item in page if isinstance(item, dict)] if isinstance(page, list) else []
+        return []
+
+    async def search_active_markets(
+        self,
+        query: str = "bitcoin up or down",
+        max_pages: int = 2,
+    ) -> list[dict[str, Any]]:
+        """Use Gamma's public search as a compatibility fallback."""
+
+        markets: list[dict[str, Any]] = []
+        for page_number in range(1, max_pages + 1):
+            try:
+                response = await self.http.get(
+                    f"{self.gamma_url}/public-search",
+                    params={
+                        "q": query,
+                        "limit_per_type": 50,
+                        "page": page_number,
+                        "events_status": "active",
+                        "search_profiles": "false",
+                        "search_tags": "false",
+                    },
+                )
+                response.raise_for_status()
+                payload = response.json()
+            except (httpx.HTTPError, ValueError) as exc:
+                self.logger.warning("[MARKET] Gamma public search unavailable: %s", exc)
+                return []
+
+            if not isinstance(payload, dict):
+                return markets
+            events = payload.get("events")
+            page_markets = payload.get("markets")
+            if isinstance(page_markets, list):
+                markets.extend(item for item in page_markets if isinstance(item, dict))
+            if isinstance(events, list):
+                for event in events:
+                    if not isinstance(event, dict):
+                        continue
+                    nested = event.get("markets")
+                    if isinstance(nested, list):
+                        markets.extend(item for item in nested if isinstance(item, dict))
+            pagination = payload.get("pagination")
+            if not isinstance(pagination, dict) or not pagination.get("hasMore"):
+                break
+
+        deduplicated: dict[str, dict[str, Any]] = {}
+        for item in markets:
+            key = str(item.get("id") or item.get("slug") or len(deduplicated))
+            deduplicated[key] = item
+        return list(deduplicated.values())
+
+    @staticmethod
+    def _token_mapping(raw: dict[str, Any]) -> tuple[list[str], dict[str, str]]:
         outcomes = [str(item) for item in parse_json_list(raw.get("outcomes"))]
         token_values = parse_json_list(raw.get("clobTokenIds") or raw.get("clob_token_ids"))
         token_by_outcome: dict[str, str] = {}
         if isinstance(raw.get("tokens"), list):
             for token in raw["tokens"]:
-                if isinstance(token, dict):
-                    token_id = token.get("token_id") or token.get("tokenId") or token.get("id")
-                    outcome = token.get("outcome") or token.get("name")
-                    if token_id and outcome:
-                        token_by_outcome[str(outcome).strip().lower()] = str(token_id)
+                if not isinstance(token, dict):
+                    continue
+                token_id = token.get("token_id") or token.get("tokenId") or token.get("id")
+                outcome = token.get("outcome") or token.get("name")
+                if token_id and outcome:
+                    token_by_outcome[str(outcome).strip().lower()] = str(token_id)
         if not token_by_outcome and outcomes and len(outcomes) == len(token_values):
             token_by_outcome = {
                 outcome.strip().lower(): str(token)
                 for outcome, token in zip(outcomes, token_values)
             }
+        return outcomes, token_by_outcome
+
+    @classmethod
+    def _parse_failure_reason(cls, raw: Any) -> str:
+        if not isinstance(raw, dict):
+            return "invalid_payload"
+        if not (raw.get("conditionId") or raw.get("condition_id")):
+            return "missing_condition_id"
+        if not (raw.get("id") or raw.get("marketId")):
+            return "missing_market_id"
+        if not parse_datetime(
+            raw.get("endDate") or raw.get("end_date") or raw.get("endDateIso")
+        ):
+            return "missing_end_time"
+        outcomes, token_by_outcome = cls._token_mapping(raw)
+        if not outcomes:
+            return "missing_outcomes"
+        if not token_by_outcome:
+            return "missing_token_ids"
+        up = {"up", "yes", "true"}.intersection(token_by_outcome)
+        down = {"down", "no", "false"}.intersection(token_by_outcome)
+        if not up or not down:
+            return "missing_up_down_tokens"
+        return "invalid_payload"
+
+    @classmethod
+    def parse_market(cls, raw: dict[str, Any]) -> PolymarketMarket | None:
+        condition_id = str(raw.get("conditionId") or raw.get("condition_id") or "")
+        market_id = str(raw.get("id") or raw.get("marketId") or "")
+        end_time = parse_datetime(
+            raw.get("endDate") or raw.get("end_date") or raw.get("endDateIso")
+        )
+        if not condition_id or not market_id or not end_time:
+            return None
+
+        _, token_by_outcome = cls._token_mapping(raw)
 
         def find_token(names: set[str]) -> str | None:
             for outcome, token in token_by_outcome.items():
@@ -584,19 +707,35 @@ class MarketDiscovery:
         if fee_rate is None:
             fee_rate = optional_float(raw.get("feeRate") or raw.get("fee_rate"))
         price_to_beat = None
-        for key in ("priceToBeat", "price_to_beat", "strikePrice", "strike_price"):
-            price_to_beat = optional_float(raw.get(key))
+        price_sources = [raw]
+        crypto_config = raw.get("cryptoMarketConfig")
+        if isinstance(crypto_config, dict):
+            price_sources.append(crypto_config)
+        for source in price_sources:
+            for key in ("priceToBeat", "price_to_beat", "strikePrice", "strike_price"):
+                price_to_beat = optional_float(source.get(key))
+                if price_to_beat is not None:
+                    break
             if price_to_beat is not None:
                 break
+
+        start_time = parse_datetime(
+            raw.get("eventStartTime")
+            or raw.get("event_start_time")
+            or raw.get("startTime")
+            or raw.get("start_time")
+            or raw.get("startDate")
+            or raw.get("start_date")
+        )
 
         return PolymarketMarket(
             market_id=market_id,
             condition_id=condition_id,
-            question=str(raw.get("question") or ""),
+            question=str(raw.get("question") or raw.get("title") or ""),
             slug=str(raw.get("slug") or ""),
             up_token_id=up_token,
             down_token_id=down_token,
-            start_time=parse_datetime(raw.get("startDate") or raw.get("start_date")),
+            start_time=start_time,
             end_time=end_time,
             resolution_source=raw.get("resolutionSource") or raw.get("resolution_source"),
             price_to_beat=price_to_beat,
@@ -614,31 +753,79 @@ class MarketDiscovery:
         )
 
     @staticmethod
-    def is_btc_5m(market: PolymarketMarket) -> bool:
-        raw_text = " ".join(
-            str(market.raw.get(key, ""))
-            for key in ("question", "slug", "description", "marketType", "seriesSlug")
-        ).lower()
+    def _market_text(raw: dict[str, Any]) -> str:
+        text_values = [
+            raw.get(key, "")
+            for key in (
+                "question",
+                "title",
+                "slug",
+                "description",
+                "marketType",
+                "seriesSlug",
+                "groupItemTitle",
+                "cryptoMarketConfig",
+            )
+        ]
+        for relation_key in ("events", "series"):
+            relation = raw.get(relation_key)
+            if isinstance(relation, list):
+                text_values.extend(item for item in relation if isinstance(item, dict))
+        return " ".join(str(value) for value in text_values).lower()
+
+    @classmethod
+    def is_btc_5m(cls, market: PolymarketMarket) -> bool:
+        raw_text = cls._market_text(market.raw)
         bitcoin = bool(re.search(r"\b(btc|bitcoin)\b", raw_text))
         duration_seconds = None
         if market.start_time:
             duration_seconds = (market.end_time - market.start_time).total_seconds()
-        five_minute_label = bool(re.search(r"5\s*[- ]?(m|min|minute)s?\b", raw_text))
+        five_minute_label = bool(
+            re.search(r"(?<!\d)5\s*[- ]?(?:m|min|minute)s?\b", raw_text)
+        )
         five_minute_duration = duration_seconds is not None and 240.0 <= duration_seconds <= 360.0
         return bitcoin and (five_minute_label or five_minute_duration)
+
+    @classmethod
+    def evaluate_market(
+        cls,
+        raw: dict[str, Any],
+        now: datetime | None = None,
+    ) -> tuple[PolymarketMarket | None, str]:
+        """Return a candidate and a stable read-only diagnostic reason."""
+
+        current = as_utc(now or datetime.now(UTC))
+        market = cls.parse_market(raw)
+        if market is None:
+            return None, cls._parse_failure_reason(raw)
+        if not re.search(r"\b(btc|bitcoin)\b", cls._market_text(market.raw)):
+            return None, "not_btc"
+        if not cls.is_btc_5m(market):
+            return None, "not_btc_5m"
+        if market.closed:
+            return None, "closed"
+        if not market.active:
+            return None, "inactive"
+        if market.accepting_orders is False:
+            return None, "not_accepting_orders"
+        if market.start_time and market.start_time > current:
+            return None, "not_started"
+        if market.end_time <= current:
+            return None, "expired"
+        return market, "eligible"
 
     async def discover_btc_5m(self, now: datetime | None = None) -> PolymarketMarket | None:
         current = as_utc(now or datetime.now(UTC))
         candidates: list[PolymarketMarket] = []
-        for raw in await self.list_active_markets():
-            market = self.parse_market(raw)
-            if not market or not self.is_btc_5m(market):
-                continue
-            if market.closed or not market.active:
-                continue
-            if market.end_time < current - timedelta(seconds=2):
-                continue
-            candidates.append(market)
+        raw_markets = await self.list_current_markets(current)
+        if not raw_markets:
+            raw_markets = await self.search_active_markets()
+        if not raw_markets:
+            raw_markets = await self.list_active_markets()
+        for raw in raw_markets:
+            market, reason = self.evaluate_market(raw, current)
+            if market is not None and reason == "eligible":
+                candidates.append(market)
         candidates.sort(key=lambda item: item.end_time)
         return candidates[0] if candidates else None
 
