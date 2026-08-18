@@ -27,7 +27,7 @@ class PaperLeg:
     entry_price: float
     notional: float
     fees: float
-    slippage: float
+    slippage: float  # USDC notional slippage for this leg.
 
 
 @dataclass
@@ -41,7 +41,7 @@ class PaperTrade:
     quantity: float
     entry_price: float
     fees: float
-    slippage: float
+    slippage: float  # USDC notional slippage across all filled legs.
     capital_required: float
     latency_ms: float
     legs: list[PaperLeg] = field(default_factory=list)

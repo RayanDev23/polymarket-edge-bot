@@ -35,8 +35,20 @@ class FeeModel:
         )
 
     def fee_for_estimate(self, estimate: ExecutionEstimate) -> float:
-        if estimate.filled_quantity <= 0 or estimate.average_price is None:
+        if estimate.filled_quantity <= 0:
             return 0.0
+        if estimate.fills:
+            # Apply the fee at each consumed execution level.  The official
+            # fee curve is nonlinear in price, so applying it once to the
+            # VWAP is not equivalent for a multi-level fill.
+            return round(
+                sum(self.fee_for_fill(quantity, price) for quantity, price in estimate.fills),
+                5,
+            )
+        if estimate.average_price is None:
+            return 0.0
+        # Compatibility fallback for synthetic estimates created without
+        # level details; all OrderBook estimates carry ``fills``.
         return self.fee_for_fill(estimate.filled_quantity, estimate.average_price)
 
 
@@ -60,6 +72,8 @@ class SignalFeatures:
 
 @dataclass
 class Opportunity:
+    """A strategy observation; estimated slippage is measured in USDC."""
+
     id: str
     timestamp: datetime
     market: str
@@ -175,6 +189,7 @@ class StrategyEngine:
     def __init__(self, config: StrategyConfig, fee_model: FeeModel) -> None:
         self.config = config
         self.fee_model = fee_model
+        self._last_late_market_analytics: dict[str, Any] | None = None
 
     def evaluate(
         self,
@@ -185,6 +200,7 @@ class StrategyEngine:
         now: datetime | None = None,
     ) -> list[Opportunity]:
         as_of = as_utc(now or tick.local_timestamp)
+        self._last_late_market_analytics = None
         features = momentum_features(
             history,
             as_of,
@@ -195,11 +211,19 @@ class StrategyEngine:
         up_book = books.get(market.up_token_id)
         down_book = books.get(market.down_token_id)
         if up_book and down_book and tick.coherent and up_book.coherent() and down_book.coherent():
-            opportunities.append(
-                self._structural_arbitrage(market, tick, up_book, down_book, features, as_of)
+            structural = self._structural_arbitrage(
+                market, tick, up_book, down_book, features, as_of
             )
+            opportunities.append(structural)
             late = self._late_market(market, tick, up_book, down_book, features, as_of)
+            if self._last_late_market_analytics is not None:
+                structural.features.setdefault("analytics", {})[
+                    "late_market"
+                ] = self._last_late_market_analytics
             if late:
+                late.features.setdefault("analytics", {})[
+                    "late_market"
+                ] = self._last_late_market_analytics
                 opportunities.append(late)
         else:
             opportunities.append(
@@ -254,23 +278,46 @@ class StrategyEngine:
             if best_up + best_down > 0
             else 0.0
         )
-        target = min(target, up_book.available_buy_quantity, down_book.available_buy_quantity)
-        up_estimate = up_book.estimate_buy_cost(target)
-        down_estimate = down_book.estimate_buy_cost(target)
-        matched = min(up_estimate.filled_quantity, down_estimate.filled_quantity)
-        if matched > 0:
-            up_estimate = up_book.estimate_buy_cost(matched)
-            down_estimate = down_book.estimate_buy_cost(matched)
+        target = min(
+            max(0.0, target),
+            up_book.available_buy_quantity,
+            down_book.available_buy_quantity,
+        )
+
+        # The best-ask sizing is only a safe upper bound.  Search the largest
+        # quantity whose two depth estimates and per-level fees fit the
+        # all-in sizing capital.
+        if target > 0:
+            upper_estimates = self._estimate_structural_pair(
+                up_book, down_book, target
+            )
+            if upper_estimates[3] > self.config.sizing_capital:
+                lower = 0.0
+                upper = target
+                for _ in range(60):
+                    candidate = (lower + upper) / 2.0
+                    candidate_estimates = self._estimate_structural_pair(
+                        up_book, down_book, candidate
+                    )
+                    if candidate_estimates[3] <= self.config.sizing_capital:
+                        lower = candidate
+                    else:
+                        upper = candidate
+                target = lower
+
+        target_quantity = target
+        up_estimate, down_estimate, matched, capital_required = self._estimate_structural_pair(
+            up_book, down_book, target
+        )
+        target = matched
         combined_price = (
             up_estimate.average_price + down_estimate.average_price
             if up_estimate.average_price is not None and down_estimate.average_price is not None
             else None
         )
-        fees = self.fee_model.fee_for_estimate(up_estimate) + self.fee_model.fee_for_estimate(
-            down_estimate
-        )
-        gross_edge = max(0.0, 1.0 - (best_up + best_down))
-        slippage = up_estimate.slippage_per_share + down_estimate.slippage_per_share
+        fees = capital_required - up_estimate.notional - down_estimate.notional
+        gross_edge = 1.0 - (best_up + best_down)
+        slippage = up_estimate.slippage_total + down_estimate.slippage_total
         cost_per_share = combined_price or 0.0
         net_edge = 1.0 - cost_per_share - (fees / matched if matched else 0.0)
         net_edge -= self.config.execution_buffer
@@ -294,7 +341,7 @@ class StrategyEngine:
             available_liquidity=liquidity,
             signal_score=net_edge,
             quantity=matched,
-            capital_required=(combined_price or 0.0) * matched + fees,
+            capital_required=capital_required,
         )
         opportunity.features["structural"] = {
             "up_best_ask": best_up,
@@ -302,7 +349,57 @@ class StrategyEngine:
             "up_levels_consumed": up_estimate.levels_consumed,
             "down_levels_consumed": down_estimate.levels_consumed,
         }
+        opportunity.features["analytics"] = {
+            "structural_arb": {
+                "timestamp": as_of.isoformat(),
+                "market_id": market.market_id,
+                "remaining_seconds": market.remaining_seconds_at(as_of),
+                "best_up_bid": up_book.best_bid.price if up_book.best_bid else None,
+                "best_up_ask": best_up if up_book.best_ask else None,
+                "best_down_bid": down_book.best_bid.price if down_book.best_bid else None,
+                "best_down_ask": best_down if down_book.best_ask else None,
+                "combined_best_ask": best_up + best_down
+                if up_book.best_ask and down_book.best_ask
+                else None,
+                "gross_edge_signed": gross_edge,
+                "target_quantity": target_quantity,
+                "matched_quantity": matched,
+                "average_up_price": up_estimate.average_price,
+                "average_down_price": down_estimate.average_price,
+                "combined_average_price": combined_price,
+                "execution_cost": up_estimate.notional + down_estimate.notional,
+                "fees_total": fees,
+                "slippage_total": slippage,
+                "execution_buffer": self.config.execution_buffer,
+                "net_edge": net_edge,
+                "capital_required": capital_required,
+                "available_up_liquidity": up_book.available_buy_quantity,
+                "available_down_liquidity": down_book.available_buy_quantity,
+                "decision": None,
+                "decision_reason": None,
+            }
+        }
         return opportunity
+
+    def _estimate_structural_pair(
+        self,
+        up_book: OrderBook,
+        down_book: OrderBook,
+        requested_quantity: float,
+    ) -> tuple[ExecutionEstimate, ExecutionEstimate, float, float]:
+        """Estimate one matched pair and its all-in USDC capital requirement."""
+
+        up_estimate = up_book.estimate_buy_cost(requested_quantity)
+        down_estimate = down_book.estimate_buy_cost(requested_quantity)
+        matched = min(up_estimate.filled_quantity, down_estimate.filled_quantity)
+        if matched > 0 and matched < requested_quantity:
+            up_estimate = up_book.estimate_buy_cost(matched)
+            down_estimate = down_book.estimate_buy_cost(matched)
+        fees = self.fee_model.fee_for_estimate(up_estimate) + self.fee_model.fee_for_estimate(
+            down_estimate
+        )
+        capital_required = up_estimate.notional + down_estimate.notional + fees
+        return up_estimate, down_estimate, matched, capital_required
 
     def _late_market(
         self,
@@ -314,14 +411,49 @@ class StrategyEngine:
         as_of: datetime,
     ) -> Opportunity | None:
         remaining = market.remaining_seconds_at(as_of)
+        analytics: dict[str, Any] = {
+            "evaluation_id": str(uuid.uuid4()),
+            "timestamp": as_of.isoformat(),
+            "market_id": market.market_id,
+            "price_to_beat": market.price_to_beat,
+            "spot_price": tick.price,
+            "realized_volatility": features.realized_volatility,
+            "volatility_observations": features.volatility_observations,
+            "model_probability": None,
+            "candidate_up": None,
+            "candidate_down": None,
+            "gross_edge": None,
+            "net_edge": None,
+            "decision": None,
+            "rejection_reason": None,
+            "price_to_beat_available": market.price_to_beat is not None,
+            "enough_volatility_observations": (
+                features.volatility_observations
+                >= self.config.minimum_volatility_observations
+            ),
+            "probability_calculated": False,
+            "candidate_signal": False,
+        }
+        self._last_late_market_analytics = analytics
         if market.price_to_beat is None or remaining <= 0:
+            analytics["rejection_reason"] = (
+                "price_to_beat_missing"
+                if market.price_to_beat is None
+                else "market_expired"
+            )
             return None
         if remaining > self.config.max_time_remaining_for_late_market_s:
+            analytics["rejection_reason"] = "outside_late_market_window"
             return None
         volatility = features.realized_volatility
         if features.volatility_observations < self.config.minimum_volatility_observations:
             volatility = self.config.volatility_fallback_annualized
         if volatility <= 0:
+            analytics["rejection_reason"] = (
+                "insufficient_volatility_observations"
+                if features.volatility_observations < self.config.minimum_volatility_observations
+                else "volatility_unavailable"
+            )
             return None
         model_up = self._probability_above_barrier(
             tick.price,
@@ -330,6 +462,8 @@ class StrategyEngine:
             remaining,
             self.config.annualization_seconds,
         )
+        analytics["model_probability"] = model_up
+        analytics["probability_calculated"] = True
         candidates: list[Opportunity] = []
         for side, book, probability in (
             ("BUY_UP", up_book, model_up),
@@ -362,7 +496,7 @@ class StrategyEngine:
                 model_probability=probability,
                 gross_edge=gross_edge,
                 estimated_fees=fees,
-                estimated_slippage=estimate.slippage_per_share,
+                estimated_slippage=estimate.slippage_total,
                 estimated_execution_risk=self._execution_risk(
                     estimate.filled_quantity, target, tick
                 ),
@@ -377,12 +511,25 @@ class StrategyEngine:
                 "remaining_seconds": remaining,
                 "barrier_distance": tick.price - market.price_to_beat,
             }
+            analytics["candidate_up" if side == "BUY_UP" else "candidate_down"] = {
+                "best_ask": best_ask,
+                "average_price": estimate.average_price,
+                "quantity": estimate.filled_quantity,
+                "gross_edge": gross_edge,
+                "net_edge": net_edge,
+            }
             candidates.append(opportunity)
         if not candidates:
+            analytics["rejection_reason"] = "no_executable_candidate"
             return None
         # Only the stronger side is a candidate; this prevents a binary market
         # from creating two opposing late-market trades at the same timestamp.
-        return max(candidates, key=lambda item: item.net_edge)
+        selected = max(candidates, key=lambda item: item.net_edge)
+        analytics["candidate_signal"] = True
+        analytics["gross_edge"] = selected.gross_edge
+        analytics["net_edge"] = selected.net_edge
+        analytics["selected_side"] = selected.side
+        return selected
 
     @staticmethod
     def _probability_above_barrier(

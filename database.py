@@ -46,6 +46,7 @@ class Database:
             """
             CREATE TABLE IF NOT EXISTS market_observations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT,
                 timestamp TEXT NOT NULL,
                 market TEXT NOT NULL,
                 btc_price REAL,
@@ -62,6 +63,7 @@ class Database:
             );
             CREATE TABLE IF NOT EXISTS orderbook_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT,
                 timestamp TEXT NOT NULL,
                 market TEXT NOT NULL,
                 token_id TEXT NOT NULL,
@@ -72,6 +74,7 @@ class Database:
             );
             CREATE TABLE IF NOT EXISTS opportunities (
                 id TEXT PRIMARY KEY,
+                session_id TEXT,
                 timestamp TEXT NOT NULL,
                 market TEXT NOT NULL,
                 strategy TEXT NOT NULL,
@@ -99,6 +102,7 @@ class Database:
             );
             CREATE TABLE IF NOT EXISTS paper_trades (
                 id TEXT PRIMARY KEY,
+                session_id TEXT,
                 opportunity_id TEXT NOT NULL,
                 entry_timestamp TEXT NOT NULL,
                 market TEXT NOT NULL,
@@ -149,6 +153,31 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_trades_entry_timestamp ON paper_trades(entry_timestamp);
             """
         )
+        # The repository already contains PAPER data created before sessions
+        # existed.  Keep those rows readable while ensuring every new run can
+        # be filtered without destroying the existing database.
+        for table in (
+            "market_observations",
+            "orderbook_snapshots",
+            "opportunities",
+            "paper_trades",
+        ):
+            columns = {
+                row[1]
+                for row in self.connection.execute(f"PRAGMA table_info({table})")
+            }
+            if "session_id" not in columns:
+                self.connection.execute(
+                    f"ALTER TABLE {table} ADD COLUMN session_id TEXT"
+                )
+        self.connection.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_observations_session ON market_observations(session_id);
+            CREATE INDEX IF NOT EXISTS idx_orderbook_session ON orderbook_snapshots(session_id);
+            CREATE INDEX IF NOT EXISTS idx_opportunities_session ON opportunities(session_id);
+            CREATE INDEX IF NOT EXISTS idx_trades_session ON paper_trades(session_id);
+            """
+        )
         self.connection.commit()
 
     def insert_observation(
@@ -157,6 +186,7 @@ class Database:
         tick: MarketTick,
         books: dict[str, OrderBook],
         now: datetime | None = None,
+        session_id: str | None = None,
     ) -> None:
         timestamp = as_utc(now or tick.local_timestamp)
         up_book = books.get(market.up_token_id)
@@ -164,12 +194,13 @@ class Database:
         self.connection.execute(
             """
             INSERT INTO market_observations
-            (timestamp, market, btc_price, btc_bid, btc_ask, btc_spread,
+            (session_id, timestamp, market, btc_price, btc_bid, btc_ask, btc_spread,
              exchange_timestamp, data_age_ms, price_to_beat, time_remaining_s,
              market_json, up_book_json, down_book_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                session_id,
                 _iso(timestamp),
                 market.market_id,
                 tick.price,
@@ -190,10 +221,11 @@ class Database:
                 self.connection.execute(
                     """
                     INSERT INTO orderbook_snapshots
-                    (timestamp, market, token_id, outcome, bids_json, asks_json, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (session_id, timestamp, market, token_id, outcome, bids_json, asks_json, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
+                        session_id,
                         _iso(timestamp),
                         market.market_id,
                         book.asset_id,
@@ -205,20 +237,25 @@ class Database:
                 )
         self.connection.commit()
 
-    def insert_opportunity(self, opportunity: Opportunity) -> None:
+    def insert_opportunity(
+        self,
+        opportunity: Opportunity,
+        session_id: str | None = None,
+    ) -> None:
         self.connection.execute(
             """
             INSERT OR REPLACE INTO opportunities
-            (id, timestamp, market, strategy, side, btc_price, price_to_beat,
+            (id, session_id, timestamp, market, strategy, side, btc_price, price_to_beat,
              time_remaining, executable_price, executable_probability,
              model_probability, gross_edge, estimated_fees, estimated_slippage,
              estimated_execution_risk, net_edge, available_liquidity, signal_score,
              decision, decision_reason, quantity, capital_required, features_json,
              up_token_id, down_token_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 opportunity.id,
+                session_id,
                 _iso(opportunity.timestamp),
                 opportunity.market,
                 opportunity.strategy,
@@ -247,17 +284,22 @@ class Database:
         )
         self.connection.commit()
 
-    def insert_trade(self, trade: PaperTrade) -> None:
+    def insert_trade(
+        self,
+        trade: PaperTrade,
+        session_id: str | None = None,
+    ) -> None:
         self.connection.execute(
             """
             INSERT OR REPLACE INTO paper_trades
-            (id, opportunity_id, entry_timestamp, market, strategy, side, quantity,
+            (id, session_id, opportunity_id, entry_timestamp, market, strategy, side, quantity,
              entry_price, fees, slippage, capital_required, latency_ms, legs_json,
              exit_timestamp, exit_price, gross_pnl, net_pnl, status, failure_reason)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 trade.id,
+                session_id,
                 trade.opportunity_id,
                 _iso(trade.entry_timestamp),
                 trade.market,
@@ -314,11 +356,25 @@ class Database:
         )
         self.connection.commit()
 
-    def fetch_opportunities(self) -> list[dict[str, Any]]:
-        return [dict(row) for row in self.connection.execute("SELECT * FROM opportunities ORDER BY timestamp")]
+    def fetch_opportunities(self, session_id: str | None = None) -> list[dict[str, Any]]:
+        if session_id is None:
+            rows = self.connection.execute("SELECT * FROM opportunities ORDER BY timestamp")
+        else:
+            rows = self.connection.execute(
+                "SELECT * FROM opportunities WHERE session_id = ? ORDER BY timestamp",
+                (session_id,),
+            )
+        return [dict(row) for row in rows]
 
-    def fetch_trades(self) -> list[dict[str, Any]]:
-        return [dict(row) for row in self.connection.execute("SELECT * FROM paper_trades ORDER BY entry_timestamp")]
+    def fetch_trades(self, session_id: str | None = None) -> list[dict[str, Any]]:
+        if session_id is None:
+            rows = self.connection.execute("SELECT * FROM paper_trades ORDER BY entry_timestamp")
+        else:
+            rows = self.connection.execute(
+                "SELECT * FROM paper_trades WHERE session_id = ? ORDER BY entry_timestamp",
+                (session_id,),
+            )
+        return [dict(row) for row in rows]
 
     def replay_observations(self, limit: int | None = None) -> Iterator[ReplayObservation]:
         query = "SELECT * FROM market_observations ORDER BY timestamp"

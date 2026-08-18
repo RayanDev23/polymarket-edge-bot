@@ -219,6 +219,15 @@ class OrderBookLevel:
 
 @dataclass(frozen=True)
 class ExecutionEstimate:
+    """Depth execution result.
+
+    ``fills`` contains the actually consumed ``(quantity, price)`` pairs.
+    It is kept so downstream fee estimates can apply the fee formula at each
+    executed level instead of approximating a multi-level fill at its VWAP.
+    Slippage fields are explicit: ``slippage_per_share`` is a price/share
+    delta, while ``slippage_total`` is a USDC notional amount.
+    """
+
     requested_quantity: float
     filled_quantity: float
     notional: float
@@ -228,6 +237,7 @@ class ExecutionEstimate:
     slippage_total: float
     complete: bool
     levels_consumed: int
+    fills: tuple[tuple[float, float], ...] = ()
 
 
 @dataclass
@@ -369,6 +379,7 @@ class OrderBook:
         notional = 0.0
         filled = 0.0
         levels_used = 0
+        fills: list[tuple[float, float]] = []
         best_price = levels[0].price
         for level in levels:
             if remaining <= 1e-12:
@@ -378,6 +389,7 @@ class OrderBook:
             notional += amount * level.price
             remaining -= amount
             levels_used += 1
+            fills.append((amount, level.price))
         average = notional / filled if filled else None
         slippage = (average - best_price) if is_buy and average is not None else 0.0
         if not is_buy and average is not None:
@@ -392,6 +404,7 @@ class OrderBook:
             slippage_total=max(0.0, slippage) * filled,
             complete=remaining <= 1e-12,
             levels_consumed=levels_used,
+            fills=tuple(fills),
         )
 
     def apply_event(self, event: dict[str, Any]) -> bool:

@@ -1,3 +1,4 @@
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -165,6 +166,20 @@ def test_fee_formula_is_explicit() -> None:
     assert FeeModel(0.07, enabled=False).fee_for_fill(100, 0.5) == 0.0
     assert FeeModel(0.25, exponent=2).fee_for_fill(100, 0.5) == pytest.approx(1.5625)
     assert FeeModel(0.07).fee_for_fill(0.001, 0.5) == 0.00002
+
+
+def test_fee_estimate_sums_fees_per_consumed_level_not_vwap() -> None:
+    order_book = book("fees", asks=((0.40, 10.0), (0.50, 20.0)))
+    estimate = order_book.estimate_buy_cost(30.0)
+    fee_model = FeeModel(0.07)
+
+    per_level = fee_model.fee_for_fill(10.0, 0.40) + fee_model.fee_for_fill(20.0, 0.50)
+    vwap_fee = fee_model.fee_for_fill(30.0, estimate.average_price or 0.0)
+
+    assert fee_model.fee_for_estimate(estimate) == pytest.approx(per_level)
+    assert per_level == pytest.approx(0.518)
+    assert vwap_fee == pytest.approx(0.52267)
+    assert fee_model.fee_for_estimate(estimate) != pytest.approx(vwap_fee)
 
 
 def test_polymarket_resolution_event_is_explicit() -> None:
@@ -376,6 +391,24 @@ async def test_process_tick_rejects_stale_books_without_trade() -> None:
     assert database.fetch_trades() == []
 
 
+@pytest.mark.asyncio
+async def test_process_tick_persists_final_analytics_decision() -> None:
+    strategy = StrategyEngine(StrategyConfig(), FeeModel(0.07))
+    database = await process_tick_for_test(
+        {"up-token": book("up-token"), "down-token": book("down-token")},
+        strategy,
+        RiskEngine(RiskConfig(minimum_net_edge=1.0)),
+    )
+
+    rows = database.fetch_opportunities()
+    assert len(rows) == 1
+    analytics = json.loads(rows[0]["features_json"])["analytics"]
+    assert analytics["structural_arb"]["decision"] == "REJECT"
+    assert analytics["structural_arb"]["decision_reason"] == "insufficient_edge"
+    assert analytics["late_market"]["price_to_beat_available"] is True
+    assert analytics["late_market"]["probability_calculated"] is False
+
+
 def test_market_discovery_maps_dynamic_outcomes_and_filters_5m() -> None:
     raw = {
         "id": "dynamic-market",
@@ -568,9 +601,10 @@ def test_structural_arb_uses_executable_depth_and_risk_accepts() -> None:
         market(now), tick(now), {"up-token": up, "down-token": down}, [tick(now)], now
     )[0]
     assert opportunity_result.strategy == "STRUCTURAL_ARB"
-    assert opportunity_result.quantity == pytest.approx(12.5)
-    assert opportunity_result.executable_price == pytest.approx(0.88)
-    assert opportunity_result.net_edge == pytest.approx(0.12)
+    assert opportunity_result.quantity == pytest.approx(35.0 / 3.0)
+    assert opportunity_result.executable_price == pytest.approx(6.0 / 7.0)
+    assert opportunity_result.net_edge == pytest.approx(1.0 / 7.0)
+    assert opportunity_result.capital_required <= 10.0
     risk = RiskEngine(RiskConfig(minimum_net_edge=0.1, minimum_liquidity=5))
     decision = risk.evaluate(
         opportunity_result,
@@ -580,6 +614,118 @@ def test_structural_arb_uses_executable_depth_and_risk_accepts() -> None:
         orderbook_coherent=True,
     )
     assert decision.accepted
+
+
+def test_structural_gross_edge_is_signed() -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    up = book("up-token", asks=((0.31, 10.0),), bids=((0.30, 10.0),))
+    down = book("down-token", asks=((0.70, 10.0),), bids=((0.69, 10.0),))
+    engine = StrategyEngine(StrategyConfig(), FeeModel(0.0))
+
+    opportunity_result = engine.evaluate(
+        market(now), tick(now), {"up-token": up, "down-token": down}, [tick(now)], now
+    )[0]
+
+    assert opportunity_result.gross_edge == pytest.approx(-0.01)
+
+
+def test_structural_sizing_is_all_in_across_depth_and_fees() -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    up = book("up-token", asks=((0.40, 1.0), (0.60, 100.0)))
+    down = book("down-token", asks=((0.40, 1.0), (0.60, 100.0)))
+    engine = StrategyEngine(StrategyConfig(sizing_capital=25.0), FeeModel(0.07))
+
+    opportunity_result = engine.evaluate(
+        market(now), tick(now), {"up-token": up, "down-token": down}, [tick(now)], now
+    )[0]
+
+    assert opportunity_result.capital_required <= 25.0 + 1e-9
+    assert opportunity_result.quantity > 1.0
+    assert opportunity_result.estimated_fees > 0.0
+    assert opportunity_result.features["structural"]["up_levels_consumed"] == 2
+    assert opportunity_result.features["structural"]["down_levels_consumed"] == 2
+
+
+def test_strategy_records_structural_and_late_market_analytics() -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    up = book("up-token", asks=((0.40, 10.0),))
+    down = book("down-token", asks=((0.40, 10.0),))
+    engine = StrategyEngine(StrategyConfig(), FeeModel(0.07))
+
+    opportunities = engine.evaluate(
+        market(now, price_to_beat=None),
+        tick(now),
+        {"up-token": up, "down-token": down},
+        [tick(now)],
+        now,
+    )
+
+    assert opportunities[0].strategy == "STRUCTURAL_ARB"
+    structural = opportunities[0].features["analytics"]["structural_arb"]
+    late = opportunities[0].features["analytics"]["late_market"]
+    assert structural["market_id"] == "m1"
+    assert structural["best_up_bid"] == pytest.approx(0.39)
+    assert structural["combined_best_ask"] == pytest.approx(0.80)
+    assert structural["gross_edge_signed"] == pytest.approx(0.20)
+    assert structural["execution_cost"] == pytest.approx(
+        structural["capital_required"] - structural["fees_total"]
+    )
+    assert late["price_to_beat"] is None
+    assert late["price_to_beat_available"] is False
+    assert late["probability_calculated"] is False
+    assert late["rejection_reason"] == "price_to_beat_missing"
+
+
+def test_strategy_records_late_market_candidate_metrics() -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    current = tick(now, 100.0)
+    history = [
+        tick(now - timedelta(seconds=seconds), 100.0 + seconds * 0.01)
+        for seconds in range(7, 0, -1)
+    ]
+    up = book("up-token", asks=((0.40, 10.0),))
+    down = book("down-token", asks=((0.40, 10.0),))
+    engine = StrategyEngine(StrategyConfig(), FeeModel(0.07))
+
+    opportunities = engine.evaluate(
+        market(now, price_to_beat=100.0),
+        current,
+        {"up-token": up, "down-token": down},
+        history + [current],
+        now,
+    )
+
+    late = next(item for item in opportunities if item.strategy == "LATE_MARKET")
+    metrics = late.features["analytics"]["late_market"]
+    assert metrics["price_to_beat_available"] is True
+    assert metrics["enough_volatility_observations"] is True
+    assert metrics["probability_calculated"] is True
+    assert metrics["model_probability"] is not None
+    assert metrics["candidate_signal"] is True
+    assert metrics["candidate_up"] is not None
+    assert metrics["candidate_down"] is not None
+
+
+def test_opportunity_and_paper_trade_slippage_use_usdc_notional() -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    up = book("up-token", asks=((0.40, 10.0), (0.60, 10.0)))
+    down = book("down-token", asks=((0.40, 10.0), (0.60, 10.0)))
+    engine = StrategyEngine(
+        StrategyConfig(sizing_capital=10.0, execution_buffer=0.0), FeeModel(0.0)
+    )
+    opportunity_result = engine.evaluate(
+        market(now), tick(now), {"up-token": up, "down-token": down}, [tick(now)], now
+    )[0]
+    trade = PaperExecutor(mode="PAPER", fee_model=FeeModel(0.0)).execute(
+        opportunity_result, {"up-token": up, "down-token": down}, now
+    )
+    expected = (
+        up.estimate_buy_cost(opportunity_result.quantity).slippage_total
+        + down.estimate_buy_cost(opportunity_result.quantity).slippage_total
+    )
+
+    assert opportunity_result.estimated_slippage == pytest.approx(expected)
+    assert trade.slippage == pytest.approx(expected)
 
 
 def test_late_probability_is_testable_and_no_future_volatility_leak() -> None:

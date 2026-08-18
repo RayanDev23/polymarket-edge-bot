@@ -8,9 +8,11 @@ import logging
 import math
 import statistics
 import time
+import uuid
 from collections import Counter
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -21,6 +23,7 @@ from data import BinanceSpotFeed, MarketDataStore, MarketTick, utc_now
 from database import Database
 from execution import PaperExecutor, PaperTrade
 from market import OrderBook, PolymarketBookFeed, PolymarketClient, PolymarketMarket
+from monitoring import default_status_path, write_runtime_status
 from risk import RiskEngine
 from strategy import FeeModel, Opportunity, StrategyEngine
 
@@ -55,6 +58,138 @@ def _numeric_summary(values: list[float]) -> dict[str, float | int | None]:
         "mean": statistics.fmean(finite) if finite else None,
         "median": statistics.median(finite) if finite else None,
         "max": max(finite) if finite else None,
+    }
+
+
+def _annotate_opportunity_analytics(opportunity: Opportunity) -> None:
+    """Copy the final risk decision into the persisted analytics payload."""
+
+    analytics = opportunity.features.get("analytics")
+    if not isinstance(analytics, dict):
+        return
+    if opportunity.strategy == "STRUCTURAL_ARB":
+        structural = analytics.get("structural_arb")
+        if isinstance(structural, dict):
+            structural["decision"] = opportunity.decision
+            structural["decision_reason"] = opportunity.decision_reason
+    elif opportunity.strategy == "LATE_MARKET":
+        late = analytics.get("late_market")
+        if isinstance(late, dict):
+            late["decision"] = opportunity.decision
+            late["rejection_reason"] = (
+                opportunity.decision_reason
+                if opportunity.decision != "ACCEPT"
+                else None
+            )
+
+
+def _runtime_status_payload(
+    *,
+    session_id: str,
+    started_at: datetime,
+    runtime_state: dict[str, Any],
+    market: PolymarketMarket | None,
+    data_store: MarketDataStore,
+    book_feed: PolymarketBookFeed,
+    risk: RiskEngine,
+    running: bool = True,
+) -> dict[str, Any]:
+    """Build a non-sensitive status snapshot for the local read-only UI."""
+
+    now = utc_now()
+    tick = data_store.latest
+    books = book_feed.books
+
+    def book_status(token_id: str | None) -> dict[str, Any]:
+        book = books.get(token_id) if token_id else None
+        if book is None:
+            return {
+                "available": False,
+                "bid": None,
+                "ask": None,
+                "bid_depth": None,
+                "ask_depth": None,
+                "age_ms": None,
+                "coherent": False,
+            }
+        return {
+            "available": True,
+            "bid": book.best_bid.price if book.best_bid else None,
+            "ask": book.best_ask.price if book.best_ask else None,
+            "bid_depth": book.available_sell_quantity,
+            "ask_depth": book.available_buy_quantity,
+            "age_ms": book.age_ms(now),
+            "coherent": book.coherent(),
+        }
+
+    last_tick_at = tick.local_timestamp.isoformat() if tick else None
+    binance_age = data_store.data_age_ms(now)
+    binance_connected = bool(data_store.health.connected and tick)
+    current = runtime_state.get("last_opportunity")
+    current = current if isinstance(current, dict) else {}
+    market_payload = None
+    if market:
+        market_payload = {
+            "market_id": market.market_id,
+            "question": market.question,
+            "slug": market.slug,
+            "condition_id": market.condition_id,
+            "start": market.start_time.isoformat() if market.start_time else None,
+            "end": market.end_time.isoformat(),
+            "remaining_seconds": market.remaining_seconds_at(now),
+        }
+    return {
+        "mode": "PAPER",
+        "paper_only": True,
+        "running": running,
+        "session_id": session_id,
+        "started_at": started_at.isoformat(),
+        "ended_at": now.isoformat() if not running else None,
+        "uptime_seconds": max(0.0, (now - started_at).total_seconds()),
+        "last_message_at": last_tick_at or book_feed.health.last_message_at.isoformat()
+        if book_feed.health.last_message_at
+        else None,
+        "binance": {
+            "status": "OK" if binance_connected and binance_age <= risk.config.maximum_data_age_ms else "STALE",
+            "connected": data_store.health.connected,
+            "last_tick_at": last_tick_at,
+            "age_ms": binance_age if tick else None,
+            "latency_ms": tick.latency_ms if tick else None,
+            "reconnects": data_store.health.reconnects,
+        },
+        "polymarket_websocket": {
+            "status": "OK" if book_feed.health.connected else "WAITING",
+            "connected": book_feed.health.connected,
+            "last_message_at": (
+                book_feed.health.last_message_at.isoformat()
+                if book_feed.health.last_message_at
+                else None
+            ),
+            "reconnects": book_feed.health.reconnects,
+        },
+        "clob": {
+            "status": runtime_state.get("clob_status", "WAITING"),
+            "last_success_at": runtime_state.get("clob_last_success_at"),
+        },
+        "market": market_payload,
+        "btc": {
+            "price": tick.price if tick else None,
+            "timestamp": last_tick_at,
+            "recent_variation": runtime_state.get("btc_recent_variation"),
+            "realized_volatility": runtime_state.get("realized_volatility"),
+            "volatility_observations": runtime_state.get("volatility_observations"),
+        },
+        "order_book": {
+            "UP": book_status(market.up_token_id if market else None),
+            "DOWN": book_status(market.down_token_id if market else None),
+        },
+        "current_opportunity": current,
+        "risk": {
+            "circuit_breaker": risk.state.circuit_breaker,
+            "breaker_reason": risk.state.breaker_reason,
+            "market_data_breaker": risk.state.market_data_breaker,
+            "market_data_breaker_reason": risk.state.market_data_breaker_reason,
+        },
     }
 
 
@@ -210,6 +345,7 @@ def _settle_matured_trades(
     database: Database,
     risk: RiskEngine,
     logger: logging.Logger,
+    session_id: str | None = None,
 ) -> None:
     """Settle only from Polymarket's explicit market resolution event."""
 
@@ -222,7 +358,7 @@ def _settle_matured_trades(
             remaining.append(trade)
             continue
         PaperExecutor.settle(trade, outcome, timestamp)
-        database.insert_trade(trade)
+        database.insert_trade(trade, session_id=session_id)
         database.update_positions_for_trade(trade)
         risk.register_closed(trade.net_pnl or 0.0, trade.capital_required)
         logger.info(
@@ -275,12 +411,29 @@ async def _process_tick(
     open_trades: list[PaperTrade],
     logger: logging.Logger,
     diagnostics: RuntimeDiagnostics | None = None,
+    session_id: str | None = None,
+    runtime_state: dict[str, Any] | None = None,
 ) -> None:
     decision_time = utc_now()
     processing_started = time.perf_counter()
     data_age = tick.age_ms(decision_time)
     data_store.history(decision_time)  # makes the anti-lookahead boundary explicit
-    database.insert_observation(market, tick, books, decision_time)
+    if runtime_state is not None:
+        previous_price = runtime_state.get("last_btc_price")
+        runtime_state["last_btc_price"] = tick.price
+        runtime_state["btc_recent_variation"] = (
+            tick.price / previous_price - 1.0
+            if isinstance(previous_price, (int, float)) and previous_price > 0
+            else None
+        )
+        runtime_state["last_message_at"] = decision_time.isoformat()
+    database.insert_observation(
+        market,
+        tick,
+        books,
+        decision_time,
+        session_id=session_id,
+    )
     logger.info(
         "[DATA] BTC=%.2f bid=%.2f ask=%.2f spread=%.4f age_ms=%.1f latency_ms=%s",
         tick.price,
@@ -325,6 +478,10 @@ async def _process_tick(
         data_store.history(decision_time),
         decision_time,
     )
+    if runtime_state is not None:
+        momentum = opportunities[0].features.get("momentum", {}) if opportunities else {}
+        runtime_state["realized_volatility"] = momentum.get("realized_volatility")
+        runtime_state["volatility_observations"] = momentum.get("volatility_observations")
     for opportunity in opportunities:
         orderbook_coherent = all(book is not None and book.coherent() for book in required_books)
         book_ages = [book.age_ms(decision_time) for book in required_books if book is not None]
@@ -362,7 +519,22 @@ async def _process_tick(
             diagnostics.record_insufficient_edge(opportunity)
         opportunity.decision = "ACCEPT" if decision.accepted else "REJECT"
         opportunity.decision_reason = decision.reason
-        database.insert_opportunity(opportunity)
+        _annotate_opportunity_analytics(opportunity)
+        database.insert_opportunity(opportunity, session_id=session_id)
+        if runtime_state is not None:
+            runtime_state["last_opportunity"] = {
+                "timestamp": opportunity.timestamp.isoformat(),
+                "strategy": opportunity.strategy,
+                "decision": opportunity.decision,
+                "decision_reason": opportunity.decision_reason,
+                "gross_edge": opportunity.gross_edge,
+                "net_edge": opportunity.net_edge,
+                "estimated_fees": opportunity.estimated_fees,
+                "estimated_slippage": opportunity.estimated_slippage,
+                "capital_required": opportunity.capital_required,
+                "quantity": opportunity.quantity,
+                "analytics": opportunity.features.get("analytics", {}),
+            }
         logger.info(
             "[STRATEGY] strategy=%s side=%s gross_edge=%.5f fees=%.5f slippage=%.5f net_edge=%.5f",
             opportunity.strategy,
@@ -376,7 +548,7 @@ async def _process_tick(
         if not decision.accepted:
             continue
         trade = executor.execute(opportunity, books, decision_time)
-        database.insert_trade(trade)
+        database.insert_trade(trade, session_id=session_id)
         database.insert_positions(trade)
         if trade.status == "FAILED":
             risk.register_failed_order()
@@ -396,6 +568,9 @@ async def _process_tick(
 
 async def run_live(config: AppConfig, duration: float | None = None) -> None:
     logger = logging.getLogger("paper-bot")
+    session_id = uuid.uuid4().hex
+    started_at = utc_now()
+    status_path = default_status_path(config.database_path)
     database = Database(config.database_path)
     database.prune_before(utc_now().replace(microsecond=0) - timedelta(days=config.retention_days))
     data_store = MarketDataStore()
@@ -411,6 +586,15 @@ async def run_live(config: AppConfig, duration: float | None = None) -> None:
     state: dict[str, PolymarketMarket | None] = {"market": None}
     open_trades: list[PaperTrade] = []
     diagnostics = RuntimeDiagnostics()
+    runtime_state: dict[str, Any] = {
+        "clob_status": "STARTING",
+        "clob_last_success_at": None,
+        "last_opportunity": None,
+        "last_btc_price": None,
+        "btc_recent_variation": None,
+        "realized_volatility": None,
+        "volatility_observations": None,
+    }
 
     async with httpx.AsyncClient(
         timeout=config.network_timeout_seconds,
@@ -427,6 +611,32 @@ async def run_live(config: AppConfig, duration: float | None = None) -> None:
         binance_feed = BinanceSpotFeed(config.binance_ws_url, data_store, logger_=logger)
         strategy: StrategyEngine | None = None
         stop = asyncio.Event()
+        last_status_write = 0.0
+
+        def publish_status(*, force: bool = False, running: bool = True) -> None:
+            nonlocal last_status_write
+            current_monotonic = time.monotonic()
+            if not force and current_monotonic - last_status_write < 0.5:
+                return
+            try:
+                write_runtime_status(
+                    status_path,
+                    _runtime_status_payload(
+                        session_id=session_id,
+                        started_at=started_at,
+                        runtime_state=runtime_state,
+                        market=state["market"],
+                        data_store=data_store,
+                        book_feed=book_feed,
+                        risk=risk,
+                        running=running,
+                    ),
+                )
+                last_status_write = current_monotonic
+            except (OSError, TypeError, ValueError) as exc:
+                logger.debug("[DASHBOARD] status publication failed: %s", exc)
+
+        publish_status(force=True)
 
         async def asset_provider() -> list[str]:
             market = state["market"]
@@ -437,6 +647,8 @@ async def run_live(config: AppConfig, duration: float | None = None) -> None:
             while not stop.is_set():
                 try:
                     market = await client.discovery.discover_btc_5m()
+                    runtime_state["clob_status"] = "OK"
+                    runtime_state["clob_last_success_at"] = utc_now().isoformat()
                     previous_market = state["market"]
                     if previous_market and (
                         market is None or market.market_id != previous_market.market_id
@@ -460,6 +672,7 @@ async def run_live(config: AppConfig, duration: float | None = None) -> None:
                             database,
                             risk,
                             logger,
+                            session_id=session_id,
                         )
                     if _market_changed(state["market"], market):
                         state["market"] = market
@@ -477,9 +690,11 @@ async def run_live(config: AppConfig, duration: float | None = None) -> None:
                         )
                     elif market is None:
                         logger.warning("[MARKET] no active BTC-5M market; waiting")
+                    publish_status(force=True)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
+                    runtime_state["clob_status"] = "ERROR"
                     logger.exception("[MARKET] discovery failed: %s", exc)
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=config.market_poll_seconds)
@@ -489,6 +704,7 @@ async def run_live(config: AppConfig, duration: float | None = None) -> None:
         async def on_tick(tick: MarketTick) -> None:
             market = state["market"]
             if not market or not strategy:
+                publish_status()
                 return
             await _process_tick(
                 tick,
@@ -502,7 +718,10 @@ async def run_live(config: AppConfig, duration: float | None = None) -> None:
                 open_trades=open_trades,
                 logger=logger,
                 diagnostics=diagnostics,
+                session_id=session_id,
+                runtime_state=runtime_state,
             )
+            publish_status()
 
         async def stop_after_duration() -> None:
             if duration is not None:
@@ -526,7 +745,11 @@ async def run_live(config: AppConfig, duration: float | None = None) -> None:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-            report = analyze(database.fetch_opportunities(), database.fetch_trades())
+            publish_status(force=True, running=False)
+            report = analyze(
+                database.fetch_opportunities(session_id=session_id),
+                database.fetch_trades(session_id=session_id),
+            )
             logger.info("[ANALYTICS] %s", report.as_dict())
             logger.info("[RISK] final_status=%s", risk.status())
             logger.info("[DIAGNOSTIC] %s", diagnostics.summary())
@@ -573,6 +796,7 @@ def run_replay(config: AppConfig, limit: int | None = None) -> int:
                 )
                 opportunity.decision = "ACCEPT" if decision.accepted else "REJECT"
                 opportunity.decision_reason = decision.reason
+                _annotate_opportunity_analytics(opportunity)
                 decisions.append(opportunity)
                 if decision.accepted:
                     trade = executor.execute(opportunity, books, observation.timestamp)

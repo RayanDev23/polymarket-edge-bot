@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta, timezone
 
 from analytics import analyze
@@ -112,3 +113,73 @@ def test_analytics_reports_rejected_opportunities_and_drawdown() -> None:
     assert report["max_drawdown"] == 4.0
     assert report["not_taken"]["by_reason"]["insufficient_edge"] == 1
     assert report["pnl_by_edge_bucket"]["<0.05"] == -1.0
+
+
+def test_strategy_analytics_report_reads_and_deduplicates_persisted_metrics() -> None:
+    late_metrics = {
+        "evaluation_id": "late-1",
+        "price_to_beat": None,
+        "spot_price": 100.0,
+        "realized_volatility": None,
+        "volatility_observations": 2,
+        "model_probability": None,
+        "candidate_up": None,
+        "candidate_down": None,
+        "gross_edge": None,
+        "net_edge": None,
+        "decision": None,
+        "rejection_reason": "price_to_beat_missing",
+        "price_to_beat_available": False,
+        "enough_volatility_observations": False,
+        "probability_calculated": False,
+        "candidate_signal": False,
+    }
+    structural_metrics = {
+        "combined_best_ask": 0.98,
+        "gross_edge_signed": 0.02,
+        "net_edge": 0.01,
+        "fees_total": 0.2,
+        "slippage_total": 0.1,
+        "remaining_seconds": 40.0,
+        "decision": "REJECT",
+        "decision_reason": "insufficient_edge",
+    }
+    late_candidate = dict(late_metrics)
+    late_candidate.update(
+        {
+            "decision": "REJECT",
+            "rejection_reason": "insufficient_edge",
+            "price_to_beat": 100.0,
+            "price_to_beat_available": True,
+            "probability_calculated": True,
+            "candidate_signal": True,
+            "model_probability": 0.6,
+            "gross_edge": 0.02,
+            "net_edge": 0.01,
+        }
+    )
+    structural = {
+        "id": "structural-1",
+        "strategy": "STRUCTURAL_ARB",
+        "decision": "REJECT",
+        "features_json": json.dumps(
+            {"analytics": {"structural_arb": structural_metrics, "late_market": late_metrics}}
+        ),
+    }
+    late = {
+        "id": "late-1",
+        "strategy": "LATE_MARKET",
+        "decision": "REJECT",
+        "features_json": json.dumps({"analytics": {"late_market": late_candidate}}),
+    }
+
+    strategy_report = analyze([structural, late], []).as_dict()["strategy_analytics"]
+    assert strategy_report["structural_arb"]["counters"]["total_evaluations"] == 1
+    assert strategy_report["structural_arb"]["counters"]["combined_ask_lt_0.99"] == 1
+    assert strategy_report["structural_arb"]["counters"]["ACCEPT"] == 0
+    assert strategy_report["late_market"]["counters"]["evaluations"] == 1
+    assert strategy_report["late_market"]["counters"]["price_to_beat_available"] == 1
+    assert strategy_report["late_market"]["counters"]["probability_calculated"] == 1
+    assert strategy_report["late_market"]["counters"]["candidate_signal"] == 1
+    assert strategy_report["late_market"]["counters"]["ACCEPT"] == 0
+    assert strategy_report["late_market"]["distributions"]["model_probability"]["median"] == 0.6
